@@ -1,0 +1,284 @@
+"""Encoder-decoder transformer with RoPE, SwiGLU and a KV-cached greedy decoder."""
+import time
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class ModelConfig:
+    vocab_size: int = 16_384
+    d_model: int = 256
+    n_heads: int = 2
+    n_enc_layers: int = 2
+    n_dec_layers: int = 2
+    max_len: int = 512  # size of the RoPE tables; must cover the longest encoder/decoder sequence
+    pad_id: int = 0
+    bos_id: int = 1
+    eos_id: int = 2
+
+    @property
+    def ffn_hidden(self):
+        # ~8/3 * d_model rounded to a multiple of 64: same params/FLOPs as a 4 * d_model MLP.
+        return int(round(8 * self.d_model / 3 / 64)) * 64
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # Normalize in fp32 so fp16 activations don't overflow in the mean of squares.
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (xf * self.weight).to(x.dtype)
+
+
+class Rotary(nn.Module):
+    """Precomputed fp32 cos/sin tables, applied with the rotate-half convention."""
+
+    def __init__(self, head_dim, max_len, base=10_000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        freqs = torch.outer(torch.arange(max_len, dtype=torch.float32), inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (max_len, head_dim)
+        self.register_buffer("cos", emb.cos(), persistent=False)
+        self.register_buffer("sin", emb.sin(), persistent=False)
+
+    def forward(self, x, positions):
+        """x: (B, H, T, hd); positions: (T,) long. Rotation is done in fp32."""
+        cos = self.cos[positions]
+        sin = self.sin[positions]
+        xf = x.float()
+        x1, x2 = xf.chunk(2, dim=-1)
+        rotated = torch.cat([-x2, x1], dim=-1)
+        return (xf * cos + rotated * sin).to(x.dtype)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.d_model // cfg.n_heads
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+    def _heads(self, x):
+        B, T, _ = x.shape
+        return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def _merge(self, x):
+        B, _, T, _ = x.shape
+        return x.transpose(1, 2).reshape(B, T, -1)
+
+    def forward(self, x, rope, attn_mask=None, is_causal=False):
+        q, k, v = (self._heads(t) for t in self.qkv(x).chunk(3, dim=-1))
+        pos = torch.arange(x.size(1), device=x.device)
+        q, k = rope(q, pos), rope(k, pos)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+        return self.out(self._merge(y))
+
+    def forward_step(self, x, rope, pos, k_cache, v_cache):
+        """One decoding step. x: (B, 1, d). Writes the new key/value at `pos` into the
+        preallocated caches (B, H, max_len, hd) and attends over positions [0, pos]."""
+        q, k, v = (self._heads(t) for t in self.qkv(x).chunk(3, dim=-1))
+        p = torch.tensor([pos], device=x.device)
+        q, k = rope(q, p), rope(k, p)  # keys are rotated once, before they enter the cache
+        k_cache[:, :, pos:pos + 1] = k
+        v_cache[:, :, pos:pos + 1] = v
+        y = F.scaled_dot_product_attention(q, k_cache[:, :, :pos + 1], v_cache[:, :, :pos + 1])
+        return self.out(self._merge(y))
+
+
+class CrossAttention(nn.Module):
+    """No RoPE: query and key positions live in different sequences."""
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.d_model // cfg.n_heads
+        self.q = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.kv = nn.Linear(cfg.d_model, 2 * cfg.d_model, bias=False)
+        self.out = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+    def _heads(self, x):
+        B, T, _ = x.shape
+        return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+    def memory_kv(self, memory):
+        k, v = self.kv(memory).chunk(2, dim=-1)
+        return self._heads(k), self._heads(v)
+
+    def forward(self, x, memory_kv, attn_mask):
+        k, v = memory_kv
+        q = self._heads(self.q(x))
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        B, _, T, _ = y.shape
+        return self.out(y.transpose(1, 2).reshape(B, T, -1))
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.gate_up = nn.Linear(cfg.d_model, 2 * cfg.ffn_hidden, bias=False)  # fused W_gate | W_up
+        self.down = nn.Linear(cfg.ffn_hidden, cfg.d_model, bias=False)
+
+    def forward(self, x):
+        gate, up = self.gate_up(x).chunk(2, dim=-1)
+        return self.down(F.silu(gate) * up)
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1, self.attn = RMSNorm(cfg.d_model), SelfAttention(cfg)
+        self.norm2, self.ffn = RMSNorm(cfg.d_model), SwiGLU(cfg)
+
+    def forward(self, x, rope, attn_mask):
+        x = x + self.attn(self.norm1(x), rope, attn_mask=attn_mask)
+        return x + self.ffn(self.norm2(x))
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1, self.self_attn = RMSNorm(cfg.d_model), SelfAttention(cfg)
+        self.norm2, self.cross_attn = RMSNorm(cfg.d_model), CrossAttention(cfg)
+        self.norm3, self.ffn = RMSNorm(cfg.d_model), SwiGLU(cfg)
+
+    def forward(self, x, rope, memory_kv, cross_mask):
+        # Right padding: causal masking alone keeps real queries away from padded keys.
+        x = x + self.self_attn(self.norm1(x), rope, is_causal=True)
+        x = x + self.cross_attn(self.norm2(x), memory_kv, cross_mask)
+        return x + self.ffn(self.norm3(x))
+
+    def forward_step(self, x, rope, pos, k_cache, v_cache, memory_kv, cross_mask):
+        x = x + self.self_attn.forward_step(self.norm1(x), rope, pos, k_cache, v_cache)
+        x = x + self.cross_attn(self.norm2(x), memory_kv, cross_mask)
+        return x + self.ffn(self.norm3(x))
+
+
+def key_mask(padding_mask):
+    """(B, S) bool, True = padding -> SDPA boolean mask (B, 1, 1, S), True = attend."""
+    return ~padding_mask[:, None, None, :]
+
+
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        # One shared vocabulary: a single embedding for encoder, decoder and the output head.
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.rope = Rotary(cfg.d_model // cfg.n_heads, cfg.max_len)
+        self.enc_layers = nn.ModuleList(EncoderLayer(cfg) for _ in range(cfg.n_enc_layers))
+        self.dec_layers = nn.ModuleList(DecoderLayer(cfg) for _ in range(cfg.n_dec_layers))
+        self.enc_norm = RMSNorm(cfg.d_model)
+        self.dec_norm = RMSNorm(cfg.d_model)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
+
+    def encode(self, encoder_input_ids, encoder_padding_mask):
+        x = self.embed(encoder_input_ids)
+        mask = key_mask(encoder_padding_mask)
+        for layer in self.enc_layers:
+            x = layer(x, self.rope, mask)
+        return self.enc_norm(x)
+
+    def logits(self, h):
+        return F.linear(h, self.embed.weight)
+
+    def decode(self, decoder_input_ids, memory, encoder_padding_mask):
+        x = self.embed(decoder_input_ids)
+        mask = key_mask(encoder_padding_mask)
+        for layer in self.dec_layers:
+            x = layer(x, self.rope, layer.cross_attn.memory_kv(memory), mask)
+        return self.logits(self.dec_norm(x))
+
+    def forward(self, encoder_input_ids, encoder_padding_mask, decoder_input_ids):
+        memory = self.encode(encoder_input_ids, encoder_padding_mask)
+        return self.decode(decoder_input_ids, memory, encoder_padding_mask)
+
+
+def token_loss(logits, labels):
+    """Sum of cross-entropy over target tokens (labels == -100 ignored) and their count."""
+    loss_sum = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(),
+                               ignore_index=-100, reduction="sum")
+    return loss_sum, (labels != -100).sum()
+
+
+# ---------------------------------------------------------------------------- generation
+
+@torch.no_grad()
+def greedy_generate(model, encoder_input_ids, encoder_padding_mask, max_new_tokens,
+                    use_cache=True, deadline=None, compact=True):
+    """Greedy decoding for one batch. Returns a list of token-id lists (without <bos>/<eos>).
+
+    deadline: absolute time.monotonic() value; when passed, decoding stops and the tokens
+    produced so far are returned. compact: drop finished rows from the batch (cache only).
+    """
+    cfg = model.cfg
+    B = encoder_input_ids.size(0)
+    device = encoder_input_ids.device
+    assert max_new_tokens + 1 <= cfg.max_len
+
+    memory = model.encode(encoder_input_ids, encoder_padding_mask)
+    cross_mask = key_mask(encoder_padding_mask)
+    out = torch.full((B, max_new_tokens), cfg.pad_id, dtype=torch.long, device=device)
+    n_out = torch.zeros(B, dtype=torch.long, device=device)  # tokens produced before <eos>
+
+    def record(rows, finished, nxt, pos):
+        """Store the step's tokens for rows that are still generating; returns new finished."""
+        live = ~finished
+        out[rows[live], pos] = nxt[live]
+        n_out[rows[live & (nxt != cfg.eos_id)]] += 1
+        return finished | (nxt == cfg.eos_id)
+
+    rows = torch.arange(B, device=device)  # original row index of each active row
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    if use_cache:
+        # Cross-attention K/V: computed once per question for each decoder layer.
+        mem_kv = [layer.cross_attn.memory_kv(memory) for layer in model.dec_layers]
+        H, hd = cfg.n_heads, cfg.d_model // cfg.n_heads
+        # Preallocated self-attention cache; positions 0..max_new_tokens-1 are ever fed in.
+        k_cache = memory.new_zeros(len(model.dec_layers), B, H, max_new_tokens, hd)
+        v_cache = torch.zeros_like(k_cache)
+        token = torch.full((B, 1), cfg.bos_id, dtype=torch.long, device=device)
+        for pos in range(max_new_tokens):
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            x = model.embed(token)
+            for i, layer in enumerate(model.dec_layers):
+                x = layer.forward_step(x, model.rope, pos, k_cache[i], v_cache[i], mem_kv[i], cross_mask)
+            nxt = model.logits(model.dec_norm(x))[:, -1].argmax(-1)
+            finished = record(rows, finished, nxt, pos)
+            if finished.all():
+                break
+            # Drop finished rows once they are a quarter of the batch, so later steps run on
+            # fewer rows without copying the cache every time a single row ends.
+            if compact and int(finished.sum()) * 4 >= finished.numel():
+                keep = ~finished
+                rows, nxt, finished, cross_mask = rows[keep], nxt[keep], finished[keep], cross_mask[keep]
+                k_cache, v_cache = k_cache[:, keep], v_cache[:, keep]
+                mem_kv = [(k[keep], v[keep]) for k, v in mem_kv]
+            token = nxt[:, None]
+    else:
+        dec = torch.full((B, 1), cfg.bos_id, dtype=torch.long, device=device)
+        for pos in range(max_new_tokens):
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            nxt = model.decode(dec, memory, encoder_padding_mask)[:, -1].argmax(-1)
+            finished = record(rows, finished, nxt, pos)
+            if finished.all():
+                break
+            dec = torch.cat([dec, nxt[:, None]], dim=1)
+
+    out, n_out = out.tolist(), n_out.tolist()
+    return [row[:n] for row, n in zip(out, n_out)]
