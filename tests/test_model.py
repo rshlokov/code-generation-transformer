@@ -79,7 +79,7 @@ def test_deadline_returns_partial():
     assert out == [[], [], [], []]
 
 
-def reference_beam(model, enc, max_new_tokens, K, alpha):
+def reference_beam(model, enc, max_new_tokens, K, alpha, temperature=1.0):
     """Plain beam search for one question: uncached decoding, Python lists, same rules."""
     cfg, mask = model.cfg, enc == PAD_ID
     memory = model.encode(enc, mask)
@@ -88,7 +88,7 @@ def reference_beam(model, enc, max_new_tokens, K, alpha):
         cands = []
         for toks, score in live:
             dec = torch.tensor([[cfg.bos_id] + toks])
-            logp = torch.log_softmax(model.decode(dec, memory, mask)[0, -1].float(), -1)
+            logp = torch.log_softmax(model.decode(dec, memory, mask)[0, -1].float() / temperature, -1)
             cands += [(score + logp[t].item(), toks, t) for t in range(cfg.vocab_size)]
         cands.sort(key=lambda c: -c[0])
         cands = cands[:2 * K]
@@ -115,11 +115,29 @@ def test_beam_matches_reference():
     """Batched, cached beam search (cache reordering, compaction) == the plain reference."""
     model = small_model(vocab_size=8, seed=0)
     encs, enc, mask = beam_inputs()
-    for K, alpha in [(3, 1.0), (2, 0.0)]:
-        ref = [reference_beam(model, e[None], 20, K, alpha) for e in encs]
+    for K, alpha, temp in [(3, 1.0, 1.0), (2, 0.0, 1.0), (3, 1.0, 0.5)]:
+        ref = [reference_beam(model, e[None], 20, K, alpha, temp) for e in encs]
         assert len({len(r) for r in ref}) > 1
         for compact in (True, False):
-            assert beam_generate(model, enc, mask, 20, num_beams=K, length_penalty=alpha, compact=compact) == ref
+            assert beam_generate(model, enc, mask, 20, num_beams=K, length_penalty=alpha,
+                                 temperature=temp, compact=compact) == ref
+
+
+@torch.no_grad()
+def test_beam_sampling():
+    model = small_model(vocab_size=8, seed=0)
+    _, enc, mask = beam_inputs(seed=3, n=12)
+
+    def sample(seed, temperature=1.0):
+        gen = torch.Generator().manual_seed(seed)
+        return beam_generate(model, enc, mask, 20, num_beams=3, temperature=temperature,
+                             do_sample=True, generator=gen)
+
+    assert sample(0) == sample(0)  # reproducible from the generator's seed
+    assert len({str(sample(s)) for s in range(5)}) > 1  # and random across seeds
+    # At a tiny temperature the Gumbel noise is negligible next to the score gaps: plain beam search.
+    temp = 1e-3
+    assert sample(0, temp) == beam_generate(model, enc, mask, 20, num_beams=3, temperature=temp)
 
 
 @torch.no_grad()
