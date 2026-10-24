@@ -33,7 +33,8 @@ def parse_args():
     p.add_argument("--experiment", required=True,
                    help="wandb run id and checkpoint artifact name ckpt-<experiment>")
     p.add_argument("--out_dir", default=default_out)
-    p.add_argument("--train_rows", type=int, default=500_000, help="random train rows to tokenize")
+    p.add_argument("--train_rows", type=int, default=None,
+                   help="random train rows to tokenize (default: all 11.8M, ~0.9 epoch in 55k steps)")
     p.add_argument("--token_budget", type=int, default=24_576, help="encoder+decoder tokens per batch per GPU")
     p.add_argument("--total_steps", type=int, default=55_000)
     p.add_argument("--warmup_steps", type=int, default=2_000)
@@ -199,7 +200,7 @@ def main():
     torch.manual_seed(args.seed)
 
     # ---- data: rank 0 tokenizes once, the other ranks wait and load the cache
-    cache = os.path.join(args.out_dir, f"tokens_{args.train_rows}_seed{args.seed}.npz")
+    cache = os.path.join(args.out_dir, f"tokens_{args.train_rows or 'all'}_seed{args.seed}")
     if is_main and not os.path.exists(cache):
         build_token_cache(cache, args.train_rows, seed=args.seed, log=log)
     if distributed:

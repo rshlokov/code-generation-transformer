@@ -1,3 +1,4 @@
 prompts/
 __pycache__/
 runs/
+wandb/

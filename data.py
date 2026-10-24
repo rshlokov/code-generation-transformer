@@ -25,49 +25,65 @@ def load_tokenizer():
     return tok
 
 
+CACHE_ARRAYS = ("q_flat", "q_off", "c_flat", "c_off")
+
+
 def _ragged(encodings):
-    """List of encodings -> (flat uint16 ids, int64 offsets)."""
+    """List of encodings -> (flat uint16 ids, int64 lengths)."""
     lens = np.fromiter((len(e.ids) for e in encodings), dtype=np.int64, count=len(encodings))
+    flat = np.fromiter((i for e in encodings for i in e.ids), dtype=np.uint16, count=int(lens.sum()))
+    return flat, lens
+
+
+def _offsets(lens):
     offsets = np.zeros(len(lens) + 1, dtype=np.int64)
     np.cumsum(lens, out=offsets[1:])
-    flat = np.fromiter((i for e in encodings for i in e.ids), dtype=np.uint16, count=int(offsets[-1]))
-    return flat, offsets
+    return offsets
 
 
-def build_token_cache(path, n_rows, seed=0, log=print):
-    """Sample n_rows uniformly from the train split, tokenize, and save ragged arrays to path.
+def build_token_cache(path, n_rows=None, seed=0, log=print):
+    """Tokenize n_rows uniformly sampled train rows (None = all) into a directory of .npy arrays.
 
-    Reads the parquet shards directly (no full Arrow conversion of the 11.8M rows) and takes
-    the same fraction of random rows from every shard. Only the train split is touched.
+    Reads the parquet shards directly and takes the same fraction of random rows from every
+    shard. Each shard is turned into flat uint16 arrays right away, so memory stays at the size
+    of the token ids even for all 11.8M rows. Only the train split is touched.
     """
     local = snapshot_download(REPO, repo_type="dataset", allow_patterns=["data/train/*.parquet"])
     shards = sorted(glob.glob(os.path.join(local, "data", "train", "*.parquet")))
     sizes = [pq.ParquetFile(s).metadata.num_rows for s in shards]
     total = sum(sizes)
-    rng = np.random.default_rng(seed)
-    chosen = np.sort(rng.choice(total, size=min(n_rows, total), replace=False))
+    take_all = n_rows is None or n_rows >= total
+    chosen = None if take_all else np.sort(np.random.default_rng(seed).choice(total, size=n_rows, replace=False))
     tok = load_tokenizer()
-    qs, cs = [], []
+    parts = {k: [] for k in ("q_flat", "q_len", "c_flat", "c_len")}
     start = 0
-    for shard, size in zip(shards, sizes):
-        idx = chosen[(chosen >= start) & (chosen < start + size)] - start
+    for n, (shard, size) in enumerate(zip(shards, sizes)):
+        table = pq.read_table(shard, columns=["question", "code"])
+        if not take_all:
+            idx = chosen[(chosen >= start) & (chosen < start + size)] - start
+            table = table.take(idx)
         start += size
-        if len(idx) == 0:
-            continue
-        table = pq.read_table(shard, columns=["question", "code"]).take(idx)
-        qs += tok.encode_batch(table.column("question").to_pylist(), add_special_tokens=False)
-        cs += tok.encode_batch(table.column("code").to_pylist(), add_special_tokens=False)
-    q_flat, q_off = _ragged(qs)
-    c_flat, c_off = _ragged(cs)
-    np.savez(path, q_flat=q_flat, q_off=q_off, c_flat=c_flat, c_off=c_off)
-    log(f"tokenized {len(qs):,} of {total:,} train rows -> {path}")
+        for side, col in (("q", "question"), ("c", "code")):
+            flat, lens = _ragged(tok.encode_batch(table.column(col).to_pylist(), add_special_tokens=False))
+            parts[f"{side}_flat"].append(flat)
+            parts[f"{side}_len"].append(lens)
+        log(f"tokenized shard {n + 1}/{len(shards)}")
+    arrays = {"q_flat": np.concatenate(parts["q_flat"]), "q_off": _offsets(np.concatenate(parts["q_len"])),
+              "c_flat": np.concatenate(parts["c_flat"]), "c_off": _offsets(np.concatenate(parts["c_len"]))}
+    tmp = path + ".tmp"
+    os.makedirs(tmp, exist_ok=True)
+    for k in CACHE_ARRAYS:
+        np.save(os.path.join(tmp, f"{k}.npy"), arrays[k])
+    os.replace(tmp, path)  # atomic: a half-written cache is never picked up
+    log(f"tokenized {len(arrays['q_off']) - 1:,} of {total:,} train rows -> {path}")
 
 
 class TokenizedPairs:
-    """Ragged question/code token arrays (no special tokens)."""
+    """Ragged question/code token arrays (no special tokens), memory-mapped from the cache
+    directory so the DDP processes share one copy in the page cache."""
 
     def __init__(self, path):
-        d = np.load(path)
+        d = {k: np.load(os.path.join(path, f"{k}.npy"), mmap_mode="r") for k in CACHE_ARRAYS}
         self.q_flat, self.q_off = d["q_flat"], d["q_off"]
         self.c_flat, self.c_off = d["c_flat"], d["c_off"]
 

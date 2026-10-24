@@ -1,6 +1,7 @@
 """Greedy generation for the 1,919 test questions -> predictions.jsonl.
 
 python predict.py --ckpt /kaggle/working/ckpt.pt                # KV cache, 170 s deadline
+python predict.py --experiment <name>                           # newest of local ckpt and wandb ckpt-<name>:latest
 python predict.py --ckpt /kaggle/working/ckpt.pt --benchmark    # time cached vs uncached on one GPU
 """
 import argparse
@@ -22,6 +23,8 @@ def parse_args():
     default_dir = "/kaggle/working" if os.path.isdir("/kaggle/working") else "runs"
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default=os.path.join(default_dir, "ckpt.pt"))
+    p.add_argument("--experiment", default=None,
+                   help="download ckpt-<experiment>:latest from wandb into --ckpt if it is newer")
     p.add_argument("--out", default=os.path.join(default_dir, "predictions.jsonl"))
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--max_new_tokens", type=int, default=219)
@@ -46,7 +49,8 @@ def load_model(ckpt_path, device):
     model.load_state_dict(ck["model"])
     model = model.to(device).eval()
     if device.type == "cuda":
-        model.half()  # RMSNorm and RoPE still compute in fp32 internally
+        model.half()
+        model.rope.float()  # half() casts buffers too; keep the cos/sin tables fp32 as in training
     return model, ck.get("experiment", ck.get("wandb_id"))  # experiment name is the wandb run id
 
 
@@ -101,7 +105,15 @@ def main():
     questions = load_test_questions()
     assert len(questions) == N_TEST, len(questions)
     programs, report, wandb_id = [""] * N_TEST, {}, None
+    import wandb
+    from train import fetch_checkpoint, wandb_login
+    logged_in = wandb_login()
+    if not logged_in and args.wandb_mode is None:
+        args.wandb_mode = "offline"
     try:
+        if args.experiment and logged_in and args.wandb_mode in (None, "online"):
+            os.makedirs(os.path.dirname(os.path.abspath(args.ckpt)), exist_ok=True)
+            fetch_checkpoint(args.wandb_project, args.experiment, args.ckpt, print)
         tok = load_tokenizer()
         model, wandb_id = load_model(args.ckpt, device)
         kw = dict(batch_size=args.batch_size, max_new_tokens=args.max_new_tokens, compact=not args.no_compact)
@@ -118,10 +130,6 @@ def main():
         write_predictions(args.out, programs)  # always exactly N_TEST lines
         print(f"wrote {args.out}")
 
-    import wandb
-    from train import wandb_login
-    if not wandb_login() and args.wandb_mode is None:
-        args.wandb_mode = "offline"
     # Attach the numbers to the training run when its id is known.
     run = wandb.init(project=args.wandb_project, id=wandb_id, resume="allow", mode=args.wandb_mode,
                      job_type="predict")
