@@ -248,7 +248,11 @@ def greedy_generate(model, encoder_input_ids, encoder_padding_mask, max_new_toke
         mem_kv = [layer.cross_attn.memory_kv(memory) for layer in model.dec_layers]
         H, hd = cfg.n_heads, cfg.d_model // cfg.n_heads
         # Preallocated self-attention cache; positions 0..max_new_tokens-1 are ever fed in.
-        k_cache = memory.new_zeros(len(model.dec_layers), B, H, max_new_tokens, hd)
+        # Under autocast the keys/values come out of the projections in the autocast dtype,
+        # while memory (the residual stream) stays fp32.
+        kv_dtype = (torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type)
+                    else memory.dtype)
+        k_cache = torch.zeros(len(model.dec_layers), B, H, max_new_tokens, hd, dtype=kv_dtype, device=device)
         v_cache = torch.zeros_like(k_cache)
         token = torch.full((B, 1), cfg.bos_id, dtype=torch.long, device=device)
         for pos in range(max_new_tokens):

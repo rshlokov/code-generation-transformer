@@ -1,30 +1,44 @@
 """DDP + FP16 training of the encoder-decoder transformer.
 
-Kaggle (2x T4):  torchrun --nproc_per_node=2 train.py --experiment <name>
+Kaggle (2x T4), first notebook cell:   import os, time; os.environ["SESSION_START"] = str(time.time())
+then:                                  torchrun --nproc_per_node=2 train.py --experiment <name>
 
-A run spans several Kaggle sessions. Each session stops cleanly after --time_budget_hours,
-uploads its checkpoint to wandb as the artifact ckpt-<experiment>:latest, and the next session
-with the same --experiment downloads it and continues the same wandb run (id = <experiment>).
-Within a session a crashed run resumes from the local <out_dir>/ckpt.pt if that is newer.
+A run spans several Kaggle sessions. Each session stops cleanly --time_budget_hours after
+SESSION_START (the script start if unset), uploads its checkpoint to wandb as the artifact
+ckpt-<experiment>:latest, and the next session with the same --experiment downloads it and
+continues the same wandb run (id = <experiment>). Within a session a crashed run resumes from the
+local <out_dir>/ckpt.pt if that is newer. The token cache comes from wandb when prepare_data.py
+(or an earlier session) has stored it, and is built and uploaded otherwise.
 """
-import argparse
-import datetime
-import math
 import os
-import random
-import time
 
-import numpy as np
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
+# Before torch is imported: every step has a different shape, and expandable segments let the
+# CUDA caching allocator reuse freed memory instead of fragmenting it into unusable pieces.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-from data import C_EDGES, Q_EDGES, BucketBatcher, TokenizedPairs, build_token_cache
-from models.model import ModelConfig, Seq2SeqTransformer, token_loss
+import argparse  # noqa: E402
+import datetime  # noqa: E402
+import math  # noqa: E402
+import random  # noqa: E402
+import time  # noqa: E402
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: E402
+from torch.utils.data import DataLoader, IterableDataset  # noqa: E402
+
+from data import (C_EDGES, PAD_ID, Q_EDGES, BucketBatcher, TokenizedPairs,  # noqa: E402
+                  build_token_cache, cache_path)
+from models.model import ModelConfig, Seq2SeqTransformer, token_loss  # noqa: E402
+from wandb_io import (fetch_checkpoint, fetch_token_cache, upload_checkpoint,  # noqa: E402
+                      upload_token_cache, wandb_login)
 
 # Arguments that define the data stream; on resume they are taken from the checkpoint so the
 # saved (epoch, batch_idx) position points into the same stream.
-DATA_ARGS = ("seed", "train_rows", "token_budget")
+DATA_ARGS = ("seed", "train_rows", "enc_tokens", "dec_tokens")
+# Arguments that define the learning-rate schedule; a resumed run must use the same values.
+SCHEDULE_ARGS = ("lr", "total_steps", "warmup_steps", "decay_frac", "min_lr_ratio")
 
 
 def parse_args():
@@ -34,8 +48,9 @@ def parse_args():
                    help="wandb run id and checkpoint artifact name ckpt-<experiment>")
     p.add_argument("--out_dir", default=default_out)
     p.add_argument("--train_rows", type=int, default=None,
-                   help="random train rows to tokenize (default: all 11.8M, ~0.9 epoch in 55k steps)")
-    p.add_argument("--token_budget", type=int, default=24_576, help="encoder+decoder tokens per batch per GPU")
+                   help="random train rows to tokenize (default: all 11.8M)")
+    p.add_argument("--enc_tokens", type=int, default=8_192, help="padded encoder tokens per batch per GPU")
+    p.add_argument("--dec_tokens", type=int, default=12_288, help="padded decoder tokens per batch per GPU")
     p.add_argument("--total_steps", type=int, default=55_000)
     p.add_argument("--warmup_steps", type=int, default=2_000)
     p.add_argument("--decay_frac", type=float, default=0.15, help="share of total steps used for the final decay")
@@ -44,10 +59,13 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--ckpt_minutes", type=float, default=25.0, help="local checkpoint interval")
-    p.add_argument("--upload_hours", type=float, default=2.0, help="wandb checkpoint upload interval")
-    p.add_argument("--time_budget_hours", type=float, default=11.5,
-                   help="clean stop this long after the script starts")
+    p.add_argument("--upload_hours", type=float, default=1.0, help="wandb checkpoint upload interval")
+    p.add_argument("--session_start", type=float, default=float(os.environ.get("SESSION_START", time.time())),
+                   help="unix time the Kaggle session started (default: $SESSION_START, else now)")
+    p.add_argument("--time_budget_hours", type=float, default=11.0,
+                   help="clean stop this long after --session_start")
     p.add_argument("--keep_ckpts", type=int, default=2, help="checkpoint versions kept in wandb")
+    p.add_argument("--loader_workers", type=int, default=1, help="processes preparing batches ahead")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wandb_project", default="code-generation-transformer")
     p.add_argument("--wandb_mode", default=None, help="online / offline / disabled")
@@ -82,20 +100,6 @@ def param_groups(model, weight_decay):
             {"params": no_decay, "weight_decay": 0.0}]
 
 
-def wandb_login():
-    """API key from Kaggle Secrets, falling back to the WANDB_API_KEY env variable or ~/.netrc."""
-    import wandb
-    key = None
-    try:
-        from kaggle_secrets import UserSecretsClient
-        key = UserSecretsClient().get_secret("WANDB_API_KEY")
-    except Exception:
-        key = os.environ.get("WANDB_API_KEY")
-    if key:
-        return wandb.login(key=key)
-    return wandb.login(verify=False) if os.path.exists(os.path.expanduser("~/.netrc")) else False
-
-
 def save_checkpoint(path, **state):
     tmp = path + ".tmp"
     torch.save(state, tmp)
@@ -115,53 +119,73 @@ def set_rng_state(s):
         torch.cuda.set_rng_state(s["cuda"])
 
 
-def fetch_checkpoint(project, experiment, ckpt_path, log):
-    """Rank 0: make ckpt_path the newest of the local checkpoint and ckpt-<experiment>:latest."""
-    import wandb
-    local_step = torch.load(ckpt_path, map_location="cpu", weights_only=False)["step"] \
-        if os.path.exists(ckpt_path) else -1
-    try:
-        art = wandb.Api().artifact(f"{project}/ckpt-{experiment}:latest", type="model")
-    except wandb.errors.CommError:
-        log(f"no checkpoint ckpt-{experiment} in wandb")
-        return
-    remote_step = art.metadata.get("step", -1)
-    if remote_step <= local_step:
-        log(f"local checkpoint (step {local_step}) is not older than wandb {art.name} (step {remote_step})")
-        return
-    folder = art.download(root=os.path.join(os.path.dirname(ckpt_path), "wandb_ckpt"))
-    os.replace(os.path.join(folder, "ckpt.pt"), ckpt_path)
-    log(f"downloaded {art.name} (step {remote_step})")
+def check_resume(ck, args, world, log):
+    """Validate a checkpoint against this run; data arguments are taken from the checkpoint."""
+    if ck["experiment"] != args.experiment:
+        raise SystemExit(f"checkpoint belongs to experiment {ck['experiment']!r}, not {args.experiment!r}")
+    if any(k not in ck["data"] for k in DATA_ARGS) or "schedule" not in ck:
+        raise SystemExit("checkpoint was written by an older train.py; start a new --experiment")
+    if ck["data"]["world_size"] != world:
+        raise SystemExit(f"checkpoint was trained on {ck['data']['world_size']} processes, not {world}")
+    changed = [f"--{k} {getattr(args, k)} (checkpoint: {ck['schedule'][k]})"
+               for k in SCHEDULE_ARGS if getattr(args, k) != ck["schedule"][k]]
+    if changed:
+        raise SystemExit("the learning-rate schedule would change mid-run: " + ", ".join(changed)
+                         + "; pass the checkpoint's values or start a new --experiment")
+    for k in DATA_ARGS:
+        if getattr(args, k) != ck["data"][k]:
+            log(f"resume: using {k}={ck['data'][k]} from the checkpoint instead of {getattr(args, k)}")
+            setattr(args, k, ck["data"][k])
 
 
-def upload_checkpoint(run, ckpt_path, experiment, step, keep, log):
-    """Rank 0: log ckpt_path as ckpt-<experiment>:latest and delete all but the newest `keep` versions."""
-    import wandb
-    art = wandb.Artifact(f"ckpt-{experiment}", type="model", metadata={"step": step})
-    art.add_file(ckpt_path, name="ckpt.pt")  # copied to wandb staging, so later saves don't race the upload
-    run.log_artifact(art, aliases=["latest"]).wait()
-    versions = wandb.Api().artifacts("model", f"{run.entity}/{run.project}/ckpt-{experiment}")
-    versions = sorted(versions, key=lambda a: int(a.version.lstrip("v")), reverse=True)
-    for old in versions[keep:]:
-        old.delete(delete_aliases=True)
-    log(f"uploaded checkpoint at step {step} as {art.name}; deleted {max(0, len(versions) - keep)} old versions")
+def probe_memory(ddp_model, model, optimizer, shape, cfg, device):
+    """Forward and backward on a synthetic batch of the heaviest bucket shape, so a batch that
+    doesn't fit fails in the first minute instead of hours into the run. Returns peak bytes."""
+    q_len, c_len, bs = shape
+    # AdamW allocates its two moment buffers at the first step; stand in for them until then.
+    adam_stub = [torch.empty_like(p) for p in model.parameters() for _ in range(2)] if not optimizer.state else []
+    g = torch.Generator().manual_seed(0)  # own generator: the global RNG state is checkpointed
+    enc = torch.randint(3, cfg.vocab_size, (bs, q_len), generator=g).to(device)
+    dec = torch.randint(3, cfg.vocab_size, (bs, c_len), generator=g).to(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        logits = ddp_model(enc, enc == PAD_ID, dec)
+        loss_sum, n_tok = token_loss(logits, dec)
+    del logits  # as in the training step
+    (loss_sum / n_tok).backward()
+    peak = torch.cuda.max_memory_allocated(device)
+    del loss_sum, adam_stub
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.reset_peak_memory_stats(device)
+    return peak
+
+
+class BatchStream(IterableDataset):
+    """The bucketed stream from a resume position, prepared in a DataLoader worker."""
+
+    def __init__(self, batcher, start_epoch, start_batch):
+        self.batcher, self.start_epoch, self.start_batch = batcher, start_epoch, start_batch
+
+    def __iter__(self):
+        return self.batcher.iterate(start_epoch=self.start_epoch, start_batch=self.start_batch)
 
 
 def main():
-    session_start = time.monotonic()
     args = parse_args()
     distributed = "RANK" in os.environ
     if distributed:
-        # Long timeout: rank 1 waits at a collective while rank 0 tokenizes, downloads or uploads.
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend, timeout=datetime.timedelta(hours=1))
-        rank, world = dist.get_rank(), dist.get_world_size()
         local_rank = int(os.environ["LOCAL_RANK"])
-        if backend == "nccl":
+        if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = torch.device("cuda", local_rank)
+            dist.init_process_group("nccl", timeout=datetime.timedelta(minutes=30), device_id=device)
         else:
             device = torch.device("cpu")
+            dist.init_process_group("gloo", timeout=datetime.timedelta(minutes=30))
+        rank, world = dist.get_rank(), dist.get_world_size()
+        # Rank 0 alone downloads or builds the checkpoint and the token cache; the other ranks wait
+        # at a CPU barrier with a long timeout, so the 30-minute NCCL timeout only covers training.
+        wait_group = dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=3))
     else:
         rank, world = 0, 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -174,6 +198,13 @@ def main():
         if is_main:
             print(msg, flush=True)
 
+    def wait_for_rank0():
+        if distributed:
+            dist.barrier(group=wait_group)
+
+    budget_left = args.time_budget_hours - (time.time() - args.session_start) / 3600
+    log(f"time budget: {budget_left:.2f} h left of {args.time_budget_hours} h")
+
     # ---- checkpoint: rank 0 picks the newest of local and wandb, the other ranks wait
     remote = False
     if is_main:
@@ -185,28 +216,23 @@ def main():
         remote = logged_in and args.wandb_mode in (None, "online")
         if remote:
             fetch_checkpoint(args.wandb_project, args.experiment, ckpt_path, log)
-    if distributed:
-        dist.barrier()
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False) if os.path.exists(ckpt_path) else None
-    if ck is not None:
-        if ck["experiment"] != args.experiment:
-            raise SystemExit(f"{ckpt_path} belongs to experiment {ck['experiment']!r}, not {args.experiment!r}")
-        if ck["data"]["world_size"] != world:
-            raise SystemExit(f"checkpoint was trained on {ck['data']['world_size']} processes, not {world}")
-        for k in DATA_ARGS:
-            if getattr(args, k) != ck["data"][k]:
-                log(f"resume: using {k}={ck['data'][k]} from the checkpoint instead of {getattr(args, k)}")
-                setattr(args, k, ck["data"][k])
+    wait_for_rank0()
+    ck = None
+    if os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location="cpu", mmap=True, weights_only=False)
+        check_resume(ck, args, world, log)
     torch.manual_seed(args.seed)
 
-    # ---- data: rank 0 tokenizes once, the other ranks wait and load the cache
-    cache = os.path.join(args.out_dir, f"tokens_{args.train_rows or 'all'}_seed{args.seed}")
+    # ---- data: rank 0 downloads the token cache from wandb or builds it, the other ranks wait
+    cache = cache_path(args.out_dir, args.train_rows, args.seed)
+    built_cache = False
     if is_main and not os.path.exists(cache):
-        build_token_cache(cache, args.train_rows, seed=args.seed, log=log)
-    if distributed:
-        dist.barrier()
+        if not (remote and fetch_token_cache(args.wandb_project, cache, args.train_rows, args.seed, log)):
+            build_token_cache(cache, args.train_rows, seed=args.seed, log=log)
+            built_cache = True
+    wait_for_rank0()
     data = TokenizedPairs(cache)
-    batcher = BucketBatcher(data, args.token_budget, rank=rank, world_size=world, seed=args.seed)
+    batcher = BucketBatcher(data, args.enc_tokens, args.dec_tokens, rank=rank, world_size=world, seed=args.seed)
     enc_pad, dec_pad = batcher.padding_fraction()
     log(f"dropped {batcher.n_dropped:,}/{batcher.n_total:,} examples longer than "
         f"{Q_EDGES[-1]} (question) or {C_EDGES[-1]} (code) tokens; "
@@ -232,7 +258,7 @@ def main():
         scaler.load_state_dict(ck["scaler"])
         scheduler.load_state_dict(ck["scheduler"])
         step, epoch, batch_idx = ck["step"], ck["data"]["epoch"], ck["data"]["batch_idx"]
-        n_skipped, n_clipped, pad_totals = ck["n_skipped"], ck["n_clipped"], ck["pad_totals"]
+        n_skipped, n_clipped, pad_totals = ck["n_skipped"], ck["n_clipped"], ck["pad_totals"].clone()
         set_rng_state(ck["rng"][rank])
         log(f"resumed from {ckpt_path} at step {step} (epoch {epoch}, batch {batch_idx})")
         del ck
@@ -244,6 +270,28 @@ def main():
 
     ddp_model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None) if distributed else model
 
+    # ---- fail fast: the heaviest batch must fit before any real step runs
+    mem_probe = {}
+    if device.type == "cuda":
+        shape = batcher.heaviest_shape()
+        total = torch.cuda.get_device_properties(device).total_memory
+        try:
+            peak = probe_memory(ddp_model, model, optimizer, shape, cfg, device)
+        except torch.OutOfMemoryError:
+            print(f"rank {rank}: the heaviest batch {shape} (question len, code len, batch size) does not "
+                  f"fit in GPU memory; lower --dec_tokens / --enc_tokens", flush=True)
+            raise
+        log(f"memory probe: heaviest batch {shape} peaks at {peak / 2**30:.2f} of {total / 2**30:.2f} GiB")
+        if peak > 0.9 * total:
+            log("warning: less than 10% GPU memory headroom; fragmentation could still cause an OOM")
+        mem_probe = {"mem/probe_peak_gib": peak / 2**30, "mem/probe_shape": list(shape)}
+
+    # Batches are prepared ahead in worker processes, started before wandb's background threads.
+    loader = DataLoader(BatchStream(batcher, epoch, batch_idx), batch_size=None,
+                        num_workers=args.loader_workers, pin_memory=use_amp,
+                        prefetch_factor=4 if args.loader_workers > 0 else None)
+    stream = iter(loader)
+
     # ---- wandb (rank 0 only); the experiment name is the run id, so every session continues one run
     wb = None
     if is_main:
@@ -252,10 +300,21 @@ def main():
                                                       "q_edges": Q_EDGES, "c_edges": C_EDGES})
         wb.summary.update({"data/dropped_examples": batcher.n_dropped, "data/total_examples": batcher.n_total,
                            "data/n_buckets": len(batcher.buckets), "data/enc_pad_frac_epoch": enc_pad,
-                           "data/dec_pad_frac_epoch": dec_pad, "model/n_params": n_params})
+                           "data/dec_pad_frac_epoch": dec_pad, "model/n_params": n_params, **mem_probe})
+        if built_cache and remote:
+            upload_token_cache(wb, cache, args.train_rows, args.seed)  # in the background; next sessions download it
+
+    saved_step = uploaded_step = -1
 
     def checkpoint(upload):
-        """Collective: every rank contributes its RNG state, rank 0 saves (and uploads)."""
+        """Collective: every rank contributes its RNG state, rank 0 saves (and uploads).
+        Skipped when this step is already saved (and uploaded, if asked): the final checkpoint
+        after a step that just hit the upload interval would otherwise upload twice."""
+        nonlocal saved_step, uploaded_step
+        if saved_step == step and (not upload or uploaded_step == step):
+            return
+        saved_step = step
+        uploaded_step = step if upload else uploaded_step
         rng = [None] * world
         if distributed:
             dist.all_gather_object(rng, get_rng_state())
@@ -267,6 +326,7 @@ def main():
                         scaler=scaler.state_dict(), scheduler=scheduler.state_dict(), step=step,
                         data={"epoch": epoch, "batch_idx": batch_idx, "world_size": world,
                               **{k: getattr(args, k) for k in DATA_ARGS}},
+                        schedule={k: getattr(args, k) for k in SCHEDULE_ARGS},
                         rng=rng, n_skipped=n_skipped, n_clipped=n_clipped, pad_totals=pad_totals,
                         experiment=args.experiment, model_config=cfg.__dict__)
         log(f"checkpoint saved at step {step}")
@@ -274,7 +334,6 @@ def main():
             upload_checkpoint(wb, ckpt_path, args.experiment, step, args.keep_ckpts, log)
 
     # ---- training loop
-    stream = batcher.iterate(start_epoch=epoch, start_batch=batch_idx)
     last_ckpt = last_upload = time.monotonic()
     ddp_model.train()
     while step < args.total_steps:
@@ -287,6 +346,7 @@ def main():
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             logits = ddp_model(batch["encoder_input_ids"], enc_mask, batch["decoder_input_ids"])
             loss_sum, n_tok = token_loss(logits, batch["labels"])
+        del logits  # the loss holds what backward needs; don't keep the fp16 logits alive too
 
         # Per-token mean over the global batch: DDP averages gradients over ranks, so scale
         # the local sum by world / global_tokens.
@@ -331,8 +391,10 @@ def main():
                 "data/batch_size": batch["labels"].size(0),
                 "perf/tokens_per_s": (stats[3] + stats[5]).item() / dt,
             }
+            if use_amp:
+                metrics["mem/peak_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
             wb.log(metrics, step=step)
-            print(f"step {step:4d} | loss {metrics['train/loss']:.4f} | lr {lr:.2e} | "
+            print(f"step {step:5d} | loss {metrics['train/loss']:.4f} | lr {lr:.2e} | "
                   f"gnorm {grad_norm:.3f} | scale {metrics['amp/scale']:.0f} | skipped {n_skipped} | "
                   f"{dt * 1000:.0f} ms", flush=True)
 
@@ -340,7 +402,7 @@ def main():
         now = time.monotonic()
         flags = torch.tensor([now - last_ckpt >= args.ckpt_minutes * 60,
                               now - last_upload >= args.upload_hours * 3600,
-                              now - session_start >= args.time_budget_hours * 3600],
+                              time.time() - args.session_start >= args.time_budget_hours * 3600],
                              dtype=torch.int32, device=device)
         if distributed:
             dist.broadcast(flags, src=0)

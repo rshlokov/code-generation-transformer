@@ -96,13 +96,13 @@ def test_bucket_batches():
     rng = np.random.default_rng(0)
     q_lens, c_lens = rng.integers(5, 140, size=3000), rng.integers(5, 270, size=3000)
     data = _FakeData(q_lens, c_lens, rng)
-    budget = 4096
+    enc_tokens, dec_tokens = 2048, 3072
     seen = []
     for rank in range(2):
-        b = BucketBatcher(data, budget, rank=rank, world_size=2)
+        b = BucketBatcher(data, enc_tokens, dec_tokens, rank=rank, world_size=2)
         assert b.n_dropped == int(((q_lens + 1 > 128) | (c_lens + 1 > 256)).sum())
         for q_len, c_len, rows in b.epoch_batches(0):
-            assert len(rows) * (q_len + c_len) <= budget
+            assert len(rows) * q_len <= enc_tokens and len(rows) * c_len <= dec_tokens
             batch = b.collate(q_len, c_len, rows)
             assert batch["encoder_input_ids"].shape == (len(rows), q_len)
             assert batch["decoder_input_ids"].shape == batch["labels"].shape == (len(rows), c_len)
@@ -116,8 +116,26 @@ def test_bucket_batches():
             seen += rows.tolist()
     assert len(seen) == len(set(seen))  # ranks get disjoint examples
     # Different epochs are shuffled differently.
-    b = BucketBatcher(data, budget)
+    b = BucketBatcher(data, enc_tokens, dec_tokens)
     assert [r.tolist() for *_, r in b.epoch_batches(0)] != [r.tolist() for *_, r in b.epoch_batches(1)]
+
+
+def test_caps_bound_each_side():
+    """Each side is capped separately: a decoder-heavy bucket is limited by the decoder cap."""
+    b = BucketBatcher(_FakeData([10], [10], np.random.default_rng(0)), enc_tokens=1000, dec_tokens=2000)
+    assert b.batch_size(24, 256) == 2000 // 256  # decoder cap binds
+    assert b.batch_size(128, 30) == 1000 // 128  # encoder cap binds
+    assert b.batch_size(512, 512) == 1  # never empty, even above both caps
+
+
+def test_heaviest_shape():
+    rng = np.random.default_rng(0)
+    q_lens, c_lens = rng.integers(5, 120, size=2000), rng.integers(5, 250, size=2000)
+    b = BucketBatcher(_FakeData(q_lens, c_lens, rng), enc_tokens=8192, dec_tokens=12288)
+    q_len, c_len, bs = b.heaviest_shape()
+    assert (q_len, c_len) in b.buckets and bs == b.batch_size(q_len, c_len)
+    cost = lambda q, c: b.batch_size(q, c) * (q + 2 * c)  # noqa: E731
+    assert cost(q_len, c_len) == max(cost(q, c) for q, c in b.buckets)
 
 
 if __name__ == "__main__":

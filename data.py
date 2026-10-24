@@ -1,4 +1,4 @@
-"""Data loading, tokenization and 2-D length bucketing with a fixed token budget."""
+"""Data loading, tokenization and 2-D length bucketing with per-side token caps."""
 import glob
 import os
 
@@ -26,6 +26,11 @@ def load_tokenizer():
 
 
 CACHE_ARRAYS = ("q_flat", "q_off", "c_flat", "c_off")
+
+
+def cache_path(out_dir, n_rows, seed):
+    """Local directory of the token cache for n_rows sampled rows (None = all)."""
+    return os.path.join(out_dir, f"tokens_{n_rows or 'all'}_seed{seed}")
 
 
 def _ragged(encodings):
@@ -106,16 +111,20 @@ class TokenizedPairs:
 
 
 class BucketBatcher:
-    """Batches from single (question bucket, code bucket) cells under a token budget.
+    """Batches from single (question bucket, code bucket) cells under per-side token caps.
+
+    The encoder and decoder sides are capped separately: a decoder token costs about twice the
+    memory of an encoder token (it also carries the logits over the vocabulary), so one shared
+    budget lets decoder-heavy buckets use far more memory than the rest.
 
     Every rank builds the same global batch list for an epoch (same seed), then takes every
     world_size-th batch, so ranks see disjoint batches and the same number of steps.
     """
 
-    def __init__(self, data: TokenizedPairs, token_budget, q_edges=Q_EDGES, c_edges=C_EDGES,
+    def __init__(self, data: TokenizedPairs, enc_tokens, dec_tokens, q_edges=Q_EDGES, c_edges=C_EDGES,
                  rank=0, world_size=1, seed=0):
         self.data = data
-        self.token_budget = token_budget
+        self.enc_tokens, self.dec_tokens = enc_tokens, dec_tokens
         self.q_edges, self.c_edges = np.array(q_edges), np.array(c_edges)
         self.rank, self.world_size, self.seed = rank, world_size, seed
 
@@ -131,7 +140,18 @@ class BucketBatcher:
             self.buckets[(int(self.q_edges[key[0]]), int(self.c_edges[key[1]]))] = idx[sel]
 
     def batch_size(self, q_len, c_len):
-        return max(1, self.token_budget // (q_len + c_len))
+        """Examples per batch: padded encoder and decoder tokens each stay within their cap."""
+        return max(1, min(self.enc_tokens // q_len, self.dec_tokens // c_len))
+
+    def heaviest_shape(self, dec_weight=2.0):
+        """(q_len, c_len, batch_size) of the bucket whose full batch needs the most memory,
+        counting a decoder token as dec_weight encoder tokens."""
+        def cost(shape):
+            q_len, c_len = shape
+            return self.batch_size(q_len, c_len) * (q_len + dec_weight * c_len)
+
+        q_len, c_len = max(self.buckets, key=cost)
+        return q_len, c_len, self.batch_size(q_len, c_len)
 
     def epoch_batches(self, epoch):
         """All batches of an epoch for this rank: list of (q_len, c_len, row indices)."""
