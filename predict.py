@@ -37,11 +37,6 @@ def parse_args():
     p.add_argument("--num_beams", type=int, default=1, help="1 = greedy, >1 = beam search (KV cache only)")
     p.add_argument("--length_penalty", type=float, default=1.0,
                    help="beam score = sum of log-probs / length ** length_penalty (0 favours short programs)")
-    p.add_argument("--temperature", type=float, default=1.0,
-                   help="beam search: logits / temperature before the log-softmax (no effect on greedy)")
-    p.add_argument("--do_sample", action="store_true",
-                   help="beam sampling: draw the continuations instead of taking the top ones")
-    p.add_argument("--seed", type=int, default=0, help="random seed for --do_sample")
     p.add_argument("--max_new_tokens", type=int, default=C_EDGES[-1] - 1,
                    help="longest code seen in training (the last code bucket holds <bos> + code)")
     p.add_argument("--deadline", type=float, default=170.0, help="seconds for the whole generation")
@@ -68,8 +63,7 @@ def load_model(ckpt_path, device):
 
 
 def generate_all(model, questions, tok, device, batch_size, max_new_tokens, use_cache=True,
-                 deadline_s=None, compact=True, num_beams=1, length_penalty=1.0, temperature=1.0,
-                 do_sample=False, seed=0):
+                 deadline_s=None, compact=True, num_beams=1, length_penalty=1.0):
     """Programs for every question, in the input order. Never raises for a failed batch:
     its questions get an empty program. Returns (programs, stats).
 
@@ -84,9 +78,8 @@ def generate_all(model, questions, tok, device, batch_size, max_new_tokens, use_
     programs = [""] * len(ids)
     n_failed_batches = n_skipped = 0
     batch_seconds = []
-    if (num_beams > 1 or do_sample) and not use_cache:
+    if num_beams > 1 and not use_cache:
         raise ValueError("beam search needs the KV cache")
-    generator = torch.Generator(device=device).manual_seed(seed) if do_sample else None
     batch_size = max(1, batch_size // num_beams)  # questions per batch: each takes num_beams rows
     autocast = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda")
     for s in range(0, len(order), batch_size):
@@ -102,11 +95,9 @@ def generate_all(model, questions, tok, device, batch_size, max_new_tokens, use_
                 enc[j, :len(ids[i])] = torch.tensor(ids[i])
             enc = enc.to(device)
             with autocast:
-                if num_beams > 1 or do_sample:
+                if num_beams > 1:
                     out = beam_generate(model, enc, enc == PAD_ID, max_new_tokens, num_beams=num_beams,
-                                        length_penalty=length_penalty, temperature=temperature,
-                                        do_sample=do_sample, generator=generator,
-                                        deadline=deadline, compact=compact)
+                                        length_penalty=length_penalty, deadline=deadline, compact=compact)
                 else:
                     out = greedy_generate(model, enc, enc == PAD_ID, max_new_tokens, use_cache=use_cache,
                                           deadline=deadline, compact=compact)
@@ -152,14 +143,10 @@ def main():
         tok = load_tokenizer()
         model, experiment = load_model(args.ckpt, device)
         kw = dict(batch_size=args.batch_size, max_new_tokens=args.max_new_tokens, compact=not args.no_compact)
-        if args.num_beams == 1 and args.temperature != 1.0 and not args.do_sample:
-            print("--temperature has no effect on greedy decoding (argmax is unchanged)")
-        beam_kw = dict(num_beams=args.num_beams, length_penalty=args.length_penalty,
-                       temperature=args.temperature, do_sample=args.do_sample, seed=args.seed)
+        beam_kw = dict(num_beams=args.num_beams, length_penalty=args.length_penalty)
         if args.benchmark:
-            name = f"{'beam_sample' if args.do_sample else 'beam'}{args.num_beams}"
-            runs = ([("greedy", dict(use_cache=True)), (name, dict(use_cache=True, **beam_kw))]
-                    if args.num_beams > 1 or args.do_sample else [("cached", dict(use_cache=True)), ("uncached", dict(use_cache=False))])
+            runs = ([("greedy", dict(use_cache=True)), (f"beam{args.num_beams}", dict(use_cache=True, **beam_kw))]
+                    if args.num_beams > 1 else [("cached", dict(use_cache=True)), ("uncached", dict(use_cache=False))])
             for name, run_kw in runs:
                 _, st = generate_all(model, questions, tok, device, **run_kw, **kw)
                 report[f"predict/time_{name}_s"] = st["seconds"]

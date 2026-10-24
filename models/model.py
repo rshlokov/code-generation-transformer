@@ -290,8 +290,7 @@ def greedy_generate(model, encoder_input_ids, encoder_padding_mask, max_new_toke
 
 @torch.no_grad()
 def beam_generate(model, encoder_input_ids, encoder_padding_mask, max_new_tokens, num_beams=4,
-                  length_penalty=1.0, temperature=1.0, do_sample=False, generator=None,
-                  deadline=None, compact=True):
+                  length_penalty=1.0, deadline=None, compact=True):
     """KV-cached beam search for one batch. Returns, per question, the token ids (without
     <bos>/<eos>) of the hypothesis with the best sum of log-probs / length ** length_penalty,
     where length counts the <eos>.
@@ -302,14 +301,6 @@ def beam_generate(model, encoder_input_ids, encoder_padding_mask, max_new_tokens
     at the current length, can't beat the worst of them (the usual heuristic). If the deadline or
     max_new_tokens cuts a question short, its best live beam competes with the finished ones.
     With num_beams=1 and length_penalty=0 this is greedy decoding.
-
-    temperature divides the logits before the log-softmax: below 1 it sharpens each step's
-    distribution, so confident steps weigh more in a beam's score than uncertain ones.
-
-    do_sample (beam sampling): the 2K continuations are drawn without replacement, each with
-    probability proportional to its extended beam's probability, instead of taken as the top 2K;
-    they are then ranked by score as usual. Uses the Gumbel-top-k trick: the top 2K of
-    score + Gumbel noise is such a sample. Lower temperature -> closer to plain beam search.
     """
     cfg = model.cfg
     B, K, V, T = encoder_input_ids.size(0), num_beams, cfg.vocab_size, max_new_tokens
@@ -348,16 +339,10 @@ def beam_generate(model, encoder_input_ids, encoder_padding_mask, max_new_tokens
         x = model.embed(token)
         for i, layer in enumerate(model.dec_layers):
             x = layer.forward_step(x, model.rope, pos, k_cache[i], v_cache[i], mem_kv[i], cross_mask)
-        logp = F.log_softmax(model.logits(model.dec_norm(x))[:, -1].float() / temperature, dim=-1)
+        logp = F.log_softmax(model.logits(model.dec_norm(x))[:, -1].float(), dim=-1)
         n = len(qs)
         cand = (scores[:, :, None] + logp.view(n, K, V)).view(n, K * V)
-        if do_sample:
-            u = torch.rand(cand.shape, generator=generator, device=device).clamp_(min=1e-20)
-            idx = (cand - torch.log(-torch.log(u))).topk(2 * K, dim=-1).indices
-            vals, order = cand.gather(1, idx).sort(dim=-1, descending=True)
-            idx = idx.gather(1, order)
-        else:
-            vals, idx = cand.topk(2 * K, dim=-1)  # sorted, best first
+        vals, idx = cand.topk(2 * K, dim=-1)  # sorted, best first
         beam, tok = idx // V, idx % V
         is_eos = tok == cfg.eos_id
 
