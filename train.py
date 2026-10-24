@@ -36,7 +36,7 @@ def parse_args():
     p.add_argument("--train_rows", type=int, default=500_000, help="random train rows to tokenize")
     p.add_argument("--token_budget", type=int, default=24_576, help="encoder+decoder tokens per batch per GPU")
     p.add_argument("--total_steps", type=int, default=55_000)
-    p.add_argument("--warmup_steps", type=int, default=20)
+    p.add_argument("--warmup_steps", type=int, default=2_000)
     p.add_argument("--decay_frac", type=float, default=0.15, help="share of total steps used for the final decay")
     p.add_argument("--min_lr_ratio", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=4e-4)
