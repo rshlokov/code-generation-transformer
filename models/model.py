@@ -286,3 +286,106 @@ def greedy_generate(model, encoder_input_ids, encoder_padding_mask, max_new_toke
 
     out, n_out = out.tolist(), n_out.tolist()
     return [row[:n] for row, n in zip(out, n_out)]
+
+
+@torch.no_grad()
+def beam_generate(model, encoder_input_ids, encoder_padding_mask, max_new_tokens, num_beams=4,
+                  length_penalty=1.0, deadline=None, compact=True):
+    """KV-cached beam search for one batch. Returns, per question, the token ids (without
+    <bos>/<eos>) of the hypothesis with the best sum of log-probs / length ** length_penalty,
+    where length counts the <eos>.
+
+    Each step expands a question's K live beams into its 2K best continuations: those ending in
+    <eos> and ranked within the top K go to the question's K finished slots, and the K best others
+    stay live. A question is done when its finished slots are full and its best live beam, scored
+    at the current length, can't beat the worst of them (the usual heuristic). If the deadline or
+    max_new_tokens cuts a question short, its best live beam competes with the finished ones.
+    With num_beams=1 and length_penalty=0 this is greedy decoding.
+    """
+    cfg = model.cfg
+    B, K, V, T = encoder_input_ids.size(0), num_beams, cfg.vocab_size, max_new_tokens
+    device = encoder_input_ids.device
+    assert max_new_tokens + 1 <= cfg.max_len
+    neg_inf = float("-inf")
+
+    memory = model.encode(encoder_input_ids, encoder_padding_mask)
+    # Beam k of question b is row b*K + k; all beams of a question share its encoder output.
+    cross_mask = key_mask(encoder_padding_mask).repeat_interleave(K, 0)
+    mem_kv = [tuple(t.repeat_interleave(K, 0) for t in layer.cross_attn.memory_kv(memory))
+              for layer in model.dec_layers]
+    H, hd = cfg.n_heads, cfg.d_model // cfg.n_heads
+    kv_dtype = (torch.get_autocast_dtype(device.type) if torch.is_autocast_enabled(device.type)
+                else memory.dtype)
+    k_cache = torch.zeros(len(model.dec_layers), B * K, H, T, hd, dtype=kv_dtype, device=device)
+    v_cache = torch.zeros_like(k_cache)
+
+    # Finished hypotheses, indexed by original question; best first.
+    fin_scores = torch.full((B, K), neg_inf, device=device)
+    fin_seqs = torch.full((B, K, T), cfg.pad_id, dtype=torch.long, device=device)
+    fin_lens = torch.zeros(B, K, dtype=torch.long, device=device)
+    # Live beams of the active questions; qs maps them to original questions.
+    qs = torch.arange(B, device=device)
+    seqs = torch.full((B, K, T), cfg.pad_id, dtype=torch.long, device=device)
+    scores = torch.full((B, K), neg_inf, device=device)
+    scores[:, 0] = 0.0  # all beams start equal: expand only the first, or they'd be K copies
+    done = torch.zeros(B, dtype=torch.bool, device=device)
+    rank = torch.arange(2 * K, device=device)
+    token = torch.full((B * K, 1), cfg.bos_id, dtype=torch.long, device=device)
+    steps = 0  # tokens in each live beam
+
+    for pos in range(T):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        x = model.embed(token)
+        for i, layer in enumerate(model.dec_layers):
+            x = layer.forward_step(x, model.rope, pos, k_cache[i], v_cache[i], mem_kv[i], cross_mask)
+        logp = F.log_softmax(model.logits(model.dec_norm(x))[:, -1].float(), dim=-1)
+        n = len(qs)
+        cand = (scores[:, :, None] + logp.view(n, K, V)).view(n, K * V)
+        vals, idx = cand.topk(2 * K, dim=-1)  # sorted, best first
+        beam, tok = idx // V, idx % V
+        is_eos = tok == cfg.eos_id
+
+        # <eos> continuations ranked within the top K become finished hypotheses.
+        new_fin = is_eos & (rank < K) & torch.isfinite(vals) & ~done[:, None]
+        fin_cand = torch.where(new_fin, vals / (pos + 1) ** length_penalty, neg_inf)
+        cand_seqs = seqs.gather(1, beam[:, :, None].expand(-1, -1, T))  # tokens before the <eos>
+        best, top = torch.cat([fin_scores[qs], fin_cand], 1).topk(K, dim=-1)
+        fin_seqs[qs] = torch.cat([fin_seqs[qs], cand_seqs], 1).gather(1, top[:, :, None].expand(-1, -1, T))
+        fin_lens[qs] = torch.cat([fin_lens[qs], torch.full_like(beam, pos)], 1).gather(1, top)
+        fin_scores[qs] = best
+
+        # The K best continuations that don't end stay live (each beam has one <eos>, so there are
+        # at least K). Reorder the cache rows to follow each new beam's source beam.
+        scores, sel = vals.masked_fill(is_eos, neg_inf).topk(K, dim=-1)
+        src_beam, new_tok = beam.gather(1, sel), tok.gather(1, sel)
+        seqs = cand_seqs.gather(1, sel[:, :, None].expand(-1, -1, T))
+        seqs[:, :, pos] = new_tok
+        steps = pos + 1
+        src = (torch.arange(n, device=device)[:, None] * K + src_beam).view(-1)
+        k_cache[:, :, :, :pos + 1] = k_cache[:, src, :, :pos + 1]
+        v_cache[:, :, :, :pos + 1] = v_cache[:, src, :, :pos + 1]
+        token = new_tok.view(-1, 1)
+
+        worst_fin = fin_scores[qs, -1]
+        done |= torch.isfinite(worst_fin) & (worst_fin >= scores[:, 0] / steps ** length_penalty)
+        if done.all():
+            break
+        # As in greedy_generate: drop done questions once they are a quarter of the batch.
+        if compact and int(done.sum()) * 4 >= n:
+            keep = ~done
+            rows = keep.repeat_interleave(K)
+            qs, seqs, scores, done = qs[keep], seqs[keep], scores[keep], done[keep]
+            token, cross_mask = token[rows], cross_mask[rows]
+            k_cache, v_cache = k_cache[:, rows], v_cache[:, rows]
+            mem_kv = [(k[rows], v[rows]) for k, v in mem_kv]
+
+    out_seqs, out_lens = fin_seqs[:, 0], fin_lens[:, 0]
+    if steps:  # questions cut short: their best live beam competes with the finished ones
+        live = ~done
+        q = qs[live]
+        better = scores[live, 0] / steps ** length_penalty > fin_scores[q, 0]
+        out_seqs[q[better]] = seqs[live, 0][better]
+        out_lens[q[better]] = steps
+    out_seqs, out_lens = out_seqs.tolist(), out_lens.tolist()
+    return [row[:n] for row, n in zip(out_seqs, out_lens)]

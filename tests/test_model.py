@@ -8,7 +8,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data import BucketBatcher, EOS_ID, PAD_ID  # noqa: E402
-from models.model import ModelConfig, Seq2SeqTransformer, greedy_generate  # noqa: E402
+from models.model import ModelConfig, Seq2SeqTransformer, beam_generate, greedy_generate  # noqa: E402
 
 
 def small_model(vocab_size=64, seed=0, std=0.3):
@@ -77,6 +77,64 @@ def test_deadline_returns_partial():
     enc = torch.randint(3, 64, (4, 10))
     out = greedy_generate(model, enc, enc == PAD_ID, max_new_tokens=50, deadline=0.0)
     assert out == [[], [], [], []]
+
+
+def reference_beam(model, enc, max_new_tokens, K, alpha):
+    """Plain beam search for one question: uncached decoding, Python lists, same rules."""
+    cfg, mask = model.cfg, enc == PAD_ID
+    memory = model.encode(enc, mask)
+    live, finished = [([], 0.0)], []  # (tokens, sum of log-probs)
+    for pos in range(max_new_tokens):
+        cands = []
+        for toks, score in live:
+            dec = torch.tensor([[cfg.bos_id] + toks])
+            logp = torch.log_softmax(model.decode(dec, memory, mask)[0, -1].float(), -1)
+            cands += [(score + logp[t].item(), toks, t) for t in range(cfg.vocab_size)]
+        cands.sort(key=lambda c: -c[0])
+        cands = cands[:2 * K]
+        for r, (score, toks, t) in enumerate(cands[:K]):
+            if t == cfg.eos_id:
+                finished.append((score / (pos + 1) ** alpha, toks))
+        finished = sorted(finished, key=lambda f: -f[0])[:K]
+        live = [(toks + [t], score) for score, toks, t in cands if t != cfg.eos_id][:K]
+        if len(finished) == K and finished[-1][0] >= live[0][1] / (pos + 1) ** alpha:
+            return finished[0][1]
+    best_live = (live[0][1] / max_new_tokens ** alpha, live[0][0])
+    return max(finished + [best_live], key=lambda f: f[0])[1]
+
+
+def beam_inputs(seed=1, n=10):
+    rng = np.random.default_rng(seed)
+    encs = [random_seq(rng, m, 8) for m in rng.integers(3, 30, size=n)]
+    enc = pad_batch(encs)
+    return encs, enc, enc == PAD_ID
+
+
+@torch.no_grad()
+def test_beam_matches_reference():
+    """Batched, cached beam search (cache reordering, compaction) == the plain reference."""
+    model = small_model(vocab_size=8, seed=0)
+    encs, enc, mask = beam_inputs()
+    for K, alpha in [(3, 1.0), (2, 0.0)]:
+        ref = [reference_beam(model, e[None], 20, K, alpha) for e in encs]
+        assert len({len(r) for r in ref}) > 1
+        for compact in (True, False):
+            assert beam_generate(model, enc, mask, 20, num_beams=K, length_penalty=alpha, compact=compact) == ref
+
+
+@torch.no_grad()
+def test_one_beam_is_greedy():
+    model = small_model(vocab_size=8, seed=0)
+    _, enc, mask = beam_inputs(seed=2, n=16)
+    assert beam_generate(model, enc, mask, 40, num_beams=1, length_penalty=0.0) == \
+        greedy_generate(model, enc, mask, 40)
+
+
+@torch.no_grad()
+def test_beam_deadline_returns_partial():
+    model = small_model()
+    enc = torch.randint(3, 64, (4, 10))
+    assert beam_generate(model, enc, enc == PAD_ID, 50, num_beams=3, deadline=0.0) == [[], [], [], []]
 
 
 class _FakeData:
