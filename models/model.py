@@ -10,10 +10,10 @@ import torch.nn.functional as F
 @dataclass
 class ModelConfig:
     vocab_size: int = 16_384
-    d_model: int = 256
-    n_heads: int = 2
-    n_enc_layers: int = 2
-    n_dec_layers: int = 2
+    d_model: int = 512
+    n_heads: int = 8
+    n_enc_layers: int = 8
+    n_dec_layers: int = 8
     max_len: int = 512  # size of the RoPE tables; must cover the longest encoder/decoder sequence
     pad_id: int = 0
     bos_id: int = 1

@@ -47,7 +47,7 @@ def load_model(ckpt_path, device):
     model = model.to(device).eval()
     if device.type == "cuda":
         model.half()  # RMSNorm and RoPE still compute in fp32 internally
-    return model, ck.get("wandb_id")
+    return model, ck.get("experiment", ck.get("wandb_id"))  # experiment name is the wandb run id
 
 
 def generate_all(model, questions, tok, device, batch_size, max_new_tokens, use_cache=True,
